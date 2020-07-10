@@ -1,5 +1,8 @@
+import logging
+from datetime import datetime, timedelta
 import flask
 import sqlalchemy
+from sqlalchemy.orm.exc import NoResultFound
 from marshmallow import (
     fields,
     post_load,
@@ -18,7 +21,7 @@ from faraday.server.models import (
     Service,
     Vulnerability,
     VulnerabilityWeb,
-)
+    AgentExecution)
 from faraday.server.utils.database import (
     get_conflict_object,
     is_unique_constraint_violation,
@@ -30,21 +33,26 @@ from faraday.server.api.modules import (
 )
 from faraday.server.api.base import AutoSchema, GenericWorkspacedView
 from faraday.server.api.modules.websocket_auth import require_agent_token
+from faraday.server.utils.bulk_create import add_creator
 
 bulk_create_api = flask.Blueprint('bulk_create_api', __name__)
 
+logger = logging.getLogger(__name__)
+
 class VulnerabilitySchema(vulns.VulnerabilitySchema):
     class Meta(vulns.VulnerabilitySchema.Meta):
+        extra_fields = ('run_date',)
         fields = tuple(
-            field_name for field_name in vulns.VulnerabilitySchema.Meta.fields
+            field_name for field_name in (vulns.VulnerabilitySchema.Meta.fields + extra_fields)
             if field_name not in ('parent', 'parent_type')
         )
 
 
-class VulnerabilityWebSchema(vulns.VulnerabilityWebSchema):
+class BulkVulnerabilityWebSchema(vulns.VulnerabilityWebSchema):
     class Meta(vulns.VulnerabilityWebSchema.Meta):
+        extra_fields = ('run_date',)
         fields = tuple(
-            field_name for field_name in vulns.VulnerabilityWebSchema.Meta.fields
+            field_name for field_name in (vulns.VulnerabilityWebSchema.Meta.fields + extra_fields)
             if field_name not in ('parent', 'parent_type')
         )
 
@@ -55,10 +63,10 @@ class PolymorphicVulnerabilityField(fields.Field):
     def __init__(self, *args, **kwargs):
         super(PolymorphicVulnerabilityField, self).__init__(*args, **kwargs)
         self.many = kwargs.get('many', False)
-        self.vuln_schema = VulnerabilitySchema(strict=True)
-        self.vulnweb_schema = VulnerabilityWebSchema(strict=True)
+        self.vuln_schema = VulnerabilitySchema()
+        self.vulnweb_schema = BulkVulnerabilityWebSchema()
 
-    def _deserialize(self, value, attr, data):
+    def _deserialize(self, value, attr, data, **kwargs):
         if self.many and not utils.is_collection(value):
             self.fail('type', input=value, type=value.__class__.__name__)
         if self.many:
@@ -76,28 +84,28 @@ class PolymorphicVulnerabilityField(fields.Field):
             schema = self.vulnweb_schema
         else:
             raise ValidationError('type must be "Vulnerability" or "VulnerabilityWeb"')
-        return schema.load(value).data
+        return schema.load(value)
 
 
-class CredentialSchema(AutoSchema):
+class BulkCredentialSchema(AutoSchema):
     class Meta:
         model = Credential
         fields = ('username', 'password', 'description', 'name')
 
 
-class ServiceSchema(services.ServiceSchema):
+class BulkServiceSchema(services.ServiceSchema):
     """It's like the original service schema, but now it only uses port
     instead of ports (a single integer array). That field was only used
     to keep backwards compatibility with the Web UI"""
-    port = fields.Integer(strict=True, required=True,
+    port = fields.Integer(required=True,
                           validate=[Range(min=0, error="The value must be greater than or equal to 0")])
     vulnerabilities = PolymorphicVulnerabilityField(
-        VulnerabilitySchema(many=True),
+        # VulnerabilitySchema(many=True),  # I have no idea what this line does, but breaks with marshmallow 3
         many=True,
         missing=[],
     )
     credentials = fields.Nested(
-        CredentialSchema(many=True),
+        BulkCredentialSchema(many=True),
         many=True,
         missing=[],
     )
@@ -113,10 +121,10 @@ class ServiceSchema(services.ServiceSchema):
         ) + ('vulnerabilities',)
 
 
-class HostSchema(hosts.HostSchema):
+class HostBulkSchema(hosts.HostSchema):
     ip = fields.String(required=True)
     services = fields.Nested(
-        ServiceSchema(many=True, context={'updating': False}),
+        BulkServiceSchema(many=True, context={'updating': False}),
         many=True,
         missing=[],
     )
@@ -126,7 +134,7 @@ class HostSchema(hosts.HostSchema):
         missing=[],
     )
     credentials = fields.Nested(
-        CredentialSchema(many=True),
+        BulkCredentialSchema(many=True),
         many=True,
         missing=[],
     )
@@ -135,7 +143,7 @@ class HostSchema(hosts.HostSchema):
         fields = hosts.HostSchema.Meta.fields + ('services', 'vulnerabilities')
 
 
-class CommandSchema(AutoSchema):
+class BulkCommandSchema(AutoSchema):
     """The schema of faraday/server/api/modules/commandsrun.py has a lot
     of ugly things because of the Web UI backwards compatibility.
 
@@ -151,21 +159,23 @@ class CommandSchema(AutoSchema):
         )
 
     @post_load
-    def load_end_date(self, data):
+    def load_end_date(self, data, **kwargs):
         duration = data.pop('duration')
         data['end_date'] = data['start_date'] + duration
+        return data
 
 
 class BulkCreateSchema(Schema):
     hosts = fields.Nested(
-        HostSchema(many=True),
+        HostBulkSchema(many=True),
         many=True,
         required=True,
     )
     command = fields.Nested(
-        CommandSchema(),
+        BulkCommandSchema(),
         required=False,
     )
+    execution_id = fields.Integer(attribute='execution_id')
 
 
 def get_or_create(ws, model_class, data):
@@ -195,8 +205,8 @@ def get_or_create(ws, model_class, data):
 
 def bulk_create(ws, data, data_already_deserialized=False):
     if not data_already_deserialized:
-        schema = BulkCreateSchema(strict=True)
-        data = schema.load(data).data
+        schema = BulkCreateSchema()
+        data = schema.load(data)
     if 'command' in data:
         command = _create_command(ws, data['command'])
     else:
@@ -271,7 +281,7 @@ def _create_vuln(ws, vuln_data, command=None, **kwargs):
     assert 'host' in kwargs or 'service' in kwargs
     assert not ('host' in kwargs and 'service' in kwargs)
 
-    attachments = vuln_data.pop('_attachments', {})
+    vuln_data.pop('_attachments', {})
     references = vuln_data.pop('references', [])
     policyviolations = vuln_data.pop('policy_violations', [])
 
@@ -285,16 +295,40 @@ def _create_vuln(ws, vuln_data, command=None, **kwargs):
         model_class = VulnerabilityWeb
     else:
         raise ValidationError("unknown type")
+    tool = vuln_data.get('tool', '')
+    if not tool:
+        if command:
+            vuln_data['tool'] = command.tool
+        else:
+            vuln_data['tool'] = 'Web UI'
 
+    run_date_string = vuln_data.pop('run_date', None)
+    if run_date_string:
+        try:
+            run_timestamp = float(run_date_string)
+            run_date = datetime.utcfromtimestamp(run_timestamp)
+            if run_date < datetime.now() + timedelta(hours=24):
+                logger.debug("Valid run date")
+            else:
+                run_date = None
+                logger.debug("Run date (%s) is greater than allowed", run_date)
+        except ValueError:
+            logger.error("Error converting run_date to a valid date")
+            flask.abort(400, "Invalid run_date")
+    else:
+        run_date = None
     (created, vuln) = get_or_create(ws, model_class, vuln_data)
-    db.session.commit()
+    if created and run_date:
+        logger.debug("Apply run date to vuln")
+        vuln.create_date = run_date
+        db.session.commit()
 
     if command is not None:
         _create_command_object_for(ws, created, vuln, command)
 
     def update_vuln(policyviolations, references, vuln):
         vuln.references = references
-        vuln.policyviolations = policyviolations
+        vuln.policy_violations = policyviolations
         # TODO attachments
         db.session.add(vuln)
         db.session.commit()
@@ -329,15 +363,79 @@ class BulkCreateView(GenericWorkspacedView):
     schema_class = BulkCreateSchema
 
     def post(self, workspace_name):
+        """
+        ---
+          tags: ["Bulk"]
+          description: Creates all faraday objects in bulk for a workspace
+          requestBody:
+            required: true
+            content:
+                application/json:
+                    schema: BulkCreateSchema
+          responses:
+            201:tags:
+              description: Created
+              content:
+                application/json:
+                  schema: BulkCreateSchema
+            403:
+               description: Disabled workspace
+            404:
+               description: Workspace not found
+        """
+        data = self._parse_data(self._get_schema_instance({}), flask.request)
+
         if flask.g.user is None:
             agent = require_agent_token()
             workspace = agent.workspace
-            assert workspace.name
-            if workspace_name != workspace.name:
+
+            if not workspace or workspace_name != workspace.name:
                 flask.abort(404, "No such workspace: %s" % workspace_name)
+
+            if "execution_id" not in data:
+                flask.abort(400, "'execution_id' argument expected")
+
+            execution_id = data["execution_id"]
+
+            agent_execution = AgentExecution.query.filter(
+                AgentExecution.id == execution_id
+            ).one_or_none()
+
+            if agent_execution is None:
+                logger.exception(
+                    NoResultFound(
+                        f"No row was found for agent executor id {execution_id}")
+                )
+                flask.abort(400, "Can not find an agent execution with that id")
+
+            if workspace_name != agent_execution.workspace.name:
+                logger.exception(
+                    ValueError(f"The {agent.name} agent has permission to workspace {workspace_name} and ask to write "
+                               f"to workspace {agent_execution.workspace.name}")
+                )
+                flask.abort(400, "Trying to write to the incorrect workspace")
+
+            now = datetime.now()
+
+            params_data = agent_execution.parameters_data
+            params = ', '.join([f'{key}={value}' for (key, value) in params_data.items()])
+
+
+            data["command"] = {
+                'tool': agent.name, # Agent name
+                'command': agent_execution.executor.name,
+                'user': '',
+                'hostname': '',
+                'params': params,
+                'import_source': 'agent',
+                'start_date': (data["command"].get("start_date") or now) if "command" in data else now, #Now or when received run
+                'end_date': (data["command"].get("start_date") or now) if "command" in data else now, #Now or when received run
+            }
         else:
             workspace = self._get_workspace(workspace_name)
-        data = self._parse_data(self._get_schema_instance({}), flask.request)
+            creator_user = flask.g.user
+            data = add_creator(data,creator_user)
+
         bulk_create(workspace, data, True)
         return "Created", 201
 
@@ -346,4 +444,3 @@ class BulkCreateView(GenericWorkspacedView):
 BulkCreateView.register(bulk_create_api)
 
 
-# I'm Py3

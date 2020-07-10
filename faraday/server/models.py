@@ -83,7 +83,7 @@ class SQLAlchemy(OriginalSQLAlchemy):
 
 
 class CustomEngineConnector(_EngineConnector):
-    """Used by overrided SQLAlchemy class to fix rollback issues.
+    """Used by overridden SQLAlchemy class to fix rollback issues.
 
     Also set case sensitive likes (in SQLite there are case
     insensitive by default)"""
@@ -100,7 +100,7 @@ class CustomEngineConnector(_EngineConnector):
         if uri.startswith('sqlite://'):
             with self._lock:
                 @event.listens_for(rv, "connect")
-                def do_connect(dbapi_connection, connection_record):
+                def do_connect(dbapi_connection, connection_record):  # pylint:disable=unused-variable
                     # disable pysqlite's emitting of the BEGIN statement
                     # entirely.  also stops it from emitting COMMIT before any
                     # DDL.
@@ -110,7 +110,7 @@ class CustomEngineConnector(_EngineConnector):
                     cursor.close()
 
                 @event.listens_for(rv, "begin")
-                def do_begin(conn):
+                def do_begin(conn): # pylint:disable=unused-variable
                     # emit our own BEGIN
                     conn.execute("BEGIN")
         return rv
@@ -782,6 +782,7 @@ class Command(Metadata):
     IMPORT_SOURCE = [
         'report',  # all the files the tools export and faraday imports it from the resports directory, gtk manual import or web import.
         'shell',  # command executed on the shell or webshell with hooks connected to faraday.
+        'agent'
     ]
 
     __tablename__ = 'command'
@@ -839,6 +840,7 @@ class VulnerabilityGeneric(VulnerabilityABC):
     issuetracker = BlankColumn(Text)
     association_date = Column(DateTime, nullable=True)
     disassociated_manually = Column(Boolean, nullable=False, default=False)
+    tool = BlankColumn(Text, nullable=False)
 
     vulnerability_duplicate_id =  Column(
                         Integer,
@@ -1273,6 +1275,29 @@ class Credential(Metadata):
         foreign_keys=[workspace_id],
     )
 
+    _host_ip_query = (
+        select([Host.ip])
+        .where(text('credential.host_id = host.id'))
+    )
+
+    _service_ip_query = (
+        select([text('host_inner.ip || \'/\' || service.name')])
+        .select_from(text('host as host_inner, service'))
+        .where(text('credential.service_id = service.id and '
+                    'host_inner.id = service.host_id'))
+    )
+
+    target_ip = column_property(
+        case([
+            (text('credential.host_id IS NOT null'),
+                _host_ip_query.as_scalar()),
+            (text('credential.service_id IS NOT null'),
+                _service_ip_query.as_scalar())
+        ]),
+        deferred=True
+    )
+
+
     __table_args__ = (
         CheckConstraint('(host_id IS NULL AND service_id IS NOT NULL) OR '
                         '(host_id IS NOT NULL AND service_id IS NULL)',
@@ -1546,6 +1571,7 @@ class User(db.Model, UserMixin):
             String(16),
             name="otp_secret", nullable=True)
     state_otp = Column(Enum(*OTP_STATES, name='user_otp_states'), nullable=False, default="disabled")
+    preferences = Column(JSONType, nullable=True, default={})
 
     # TODO: add  many to many relationship to add permission to workspace
 
@@ -1905,15 +1931,27 @@ class KnowledgeBase(db.Model):
 
 class Rule(Metadata):
     __tablename__ = 'rule'
-
     id = Column(Integer, primary_key=True)
     model = Column(String, nullable=False)
     object_parent = Column(String, nullable=True)
     fields = Column(JSONType, nullable=True)
     object = Column(JSONType, nullable=False)
+    enabled = Column(Boolean, nullable=False, default=True)
     actions = relationship("Action", secondary="rule_action", backref=backref("rules"))
     workspace_id = Column(Integer, ForeignKey('workspace.id'), index=True, nullable=False)
     workspace = relationship('Workspace', backref=backref('rules', cascade="all, delete-orphan"))
+
+    @property
+    def parent(self):
+        return
+
+    @property
+    def disabled(self):
+        return not self.enabled
+
+    @disabled.setter
+    def disabled(self, value):
+        self.enabled = not value
 
 
 class Action(Metadata):
@@ -2031,6 +2069,7 @@ class AgentExecution(Metadata):
         'Workspace',
         backref=backref('agent_executions', cascade="all, delete-orphan"),
     )
+    parameters_data = Column(JSONType, nullable=False)
 
     @property
     def parent(self):
@@ -2119,5 +2158,4 @@ event.listen(
 )
 
 # We have to import this after all models are defined
-import faraday.server.events
-# I'm Py3
+import faraday.server.events # pylint: disable=unused-import

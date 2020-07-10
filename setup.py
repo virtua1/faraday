@@ -33,9 +33,8 @@ with open('faraday/__init__.py', 'rt', encoding='utf8') as f:
     version = search(r'__version__ = \'(.*?)\'', f.read()).group(1)
 
 # Taken from https://stackoverflow.com/questions/14399534/reference-requirements-txt-for-the-install-requires-kwarg-in-setuptools-setup-py/14399775#14399775
-with open('requirements_server.txt') as fp:
+with open('requirements.txt') as fp:
     required = fp.read().splitlines()
-    required.reverse()
 
 with open('requirements_dev.txt') as fp:
     dev_required = fp.read().splitlines()
@@ -211,8 +210,7 @@ setup(
     # MANIFEST.in as well.
     include_package_data=True,
     package_data={  # Optional
-         '': ['requirements.txt',
-              'requirements_server.txt'],
+         '': ['requirements.txt',],
     },
 
     # Although 'package_data' is the preferred approach, in some case you may
@@ -233,8 +231,6 @@ setup(
     entry_points={  # Optional
         'console_scripts': [
             'faraday-server=faraday.start_server:main',
-            'faraday-client=faraday.client.start_client:main',
-            'fplugin=faraday.client.bin.fplugin:main',
             'faraday-manage=faraday.manage:cli',
             'faraday-searcher=faraday.searcher.searcher:main'
         ],

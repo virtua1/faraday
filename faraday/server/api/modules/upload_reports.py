@@ -5,6 +5,8 @@ import os
 import string
 import random
 import logging
+
+from faraday.server.config import CONST_FARADAY_HOME_PATH
 from faraday.server.threads.reports_processor import REPORTS_QUEUE
 from flask import (
     request,
@@ -13,6 +15,7 @@ from flask import (
     jsonify,
     Blueprint,
 )
+import flask
 
 from flask_wtf.csrf import validate_csrf
 from werkzeug.utils import secure_filename
@@ -20,9 +23,7 @@ from wtforms import ValidationError
 
 from faraday.server.utils.web import gzipped
 from faraday.server.models import Workspace
-from faraday.config.configuration import getInstanceConfiguration
 
-CONF = getInstanceConfiguration()
 upload_api = Blueprint('upload_reports', __name__)
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,7 @@ def file_upload(workspace=None):
         raw_report_filename = '{0}_{1}'.format(random_prefix, secure_filename(report_file.filename))
 
         try:
-            file_path = os.path.join(CONF.getConfigPath(), 'uploaded_reports', raw_report_filename)
+            file_path = os.path.join(CONST_FARADAY_HOME_PATH, 'uploaded_reports', raw_report_filename)
             with open(file_path, 'wb') as output:
                 output.write(report_file.read())
         except AttributeError:
@@ -66,7 +67,8 @@ def file_upload(workspace=None):
                 "Upload reports in WEB-UI not configurated, run Faraday client and try again...")
             abort(make_response(jsonify(message="Upload reports not configurated: Run faraday client and start Faraday server again"), 500))
         else:
-            REPORTS_QUEUE.put((workspace, file_path))
+            REPORTS_QUEUE.put((workspace, file_path, flask.g.user))
             return make_response(jsonify(message="ok"), 200)
     else:
         abort(make_response(jsonify(message="Missing report file"), 400))
+# I'm Py3

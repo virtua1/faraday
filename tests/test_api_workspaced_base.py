@@ -228,7 +228,46 @@ class UpdateTestsMixin:
 
 
 class CountTestsMixin:
-    pass
+    def test_count(self, test_client, session, user_factory):
+
+        session.add(self.factory.create(creator=self.first_object.creator, 
+                                        workspace=self.first_object.workspace))
+
+        session.commit()
+        res = test_client.get(self.url() + "count/?group_by=creator_id")
+        assert res.status_code == 200, res.json
+        res = res.get_json()
+
+        creators = []
+        grouped = 0
+        for obj in res['groups']:
+            if obj['count'] == 2:
+                grouped += 1
+            creators.append(obj['creator_id'])
+
+        assert grouped == 1
+        assert creators == sorted(creators)
+
+    def test_count_descending(self, test_client, session, user_factory):
+
+        session.add(self.factory.create(creator=self.first_object.creator, 
+                                        workspace=self.first_object.workspace))
+
+        session.commit()
+        res = test_client.get(self.url() + "count/?group_by=creator_id&order=desc")
+        assert res.status_code == 200, res.json
+        res = res.get_json()
+
+        creators = []
+        grouped = 0
+        for obj in res['groups']:
+            if obj['count'] == 2:
+                grouped += 1
+            creators.append(obj['creator_id'])
+
+        assert grouped == 1
+        assert creators == sorted(creators, reverse=True)
+
 
 
 class DeleteTestsMixin:

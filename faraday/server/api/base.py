@@ -9,18 +9,19 @@ import logging
 
 import flask
 import sqlalchemy
+import datetime
+from collections import defaultdict
 from flask import g
 from flask_classful import FlaskView
 from sqlalchemy.orm import joinedload, undefer
 from sqlalchemy.orm.exc import NoResultFound, ObjectDeletedError
 from sqlalchemy.inspection import inspect
-from sqlalchemy import func
-from marshmallow import Schema
-from marshmallow.compat import with_metaclass
+from sqlalchemy import func, desc, asc
+from marshmallow import Schema, EXCLUDE, fields
 from marshmallow.validate import Length
 from marshmallow_sqlalchemy import ModelConverter
 from marshmallow_sqlalchemy.schema import ModelSchemaMeta, ModelSchemaOpts
-from webargs.flaskparser import FlaskParser, parser as parser_imported
+from webargs.flaskparser import FlaskParser
 from webargs.core import ValidationError
 from faraday.server.models import Workspace, db, Command, CommandObject
 from faraday.server.schemas import NullToBlankString
@@ -30,6 +31,7 @@ from faraday.server.utils.database import (
     )
 
 from faraday.server.utils.py3 import BytesJSONEncoder
+from faraday.server.config import faraday_server
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +82,6 @@ class GenericView(FlaskView):
 
     #: **Required**. The class of the SQLAlchemy model this view will handle
     model_class = None
-
     #: **Required** (unless _get_schema_class is overwritten).
     #: A subclass of `marshmallow.Schema` to serialize and deserialize the
     #: data provided by the user
@@ -161,17 +162,16 @@ class GenericView(FlaskView):
     def _get_schema_instance(self, route_kwargs, **kwargs):
         """Instances a model schema.
 
-        By default it uses sets strict to True
-        but this can be overriden as well as any other parameters in
-        the function's kwargs.
-
         It also uses _set_schema_context to set the context of the
         schema.
         """
-        if 'strict' not in kwargs:
-            kwargs['strict'] = True
         kwargs['context'] = self._set_schema_context(
             kwargs.get('context', {}), **route_kwargs)
+
+        # If the client send us fields that are not in the schema, ignore them
+        # This is the default in marshmallow 2, but not in marshmallow 3
+        kwargs['unknown'] = EXCLUDE
+
         return self._get_schema_class()(**kwargs)
 
     def _set_schema_context(self, context, **kwargs):
@@ -284,7 +284,7 @@ class GenericView(FlaskView):
         TODO migration: document route_kwargs
         """
         try:
-            return self._get_schema_instance(route_kwargs, **kwargs).dump(obj).data
+            return self._get_schema_instance(route_kwargs, **kwargs).dump(obj)
         except ObjectDeletedError:
             return []
 
@@ -293,7 +293,7 @@ class GenericView(FlaskView):
         data. It a ``Marshmallow.Schema`` instance to perform the
         deserialization
         """
-        return FlaskParser().parse(schema, request, locations=('json',),
+        return FlaskParser().parse(schema, request, location="json",
                                    *args, **kwargs)
 
     @classmethod
@@ -303,7 +303,7 @@ class GenericView(FlaskView):
         super(GenericView, cls).register(app, *args, **kwargs)
 
         @app.errorhandler(422)
-        def handle_error(err):
+        def handle_error(err): # pylint: disable=unused-variable
             # webargs attaches additional metadata to the `data` attribute
             exc = getattr(err, 'exc')
             if exc:
@@ -316,7 +316,7 @@ class GenericView(FlaskView):
             }), 400
 
         @app.errorhandler(409)
-        def handle_conflict(err):
+        def handle_conflict(err): # pylint: disable=unused-variable
             # webargs attaches additional metadata to the `data` attribute
             exc = getattr(err, 'exc', None) or getattr(err, 'description', None)
             if exc:
@@ -327,11 +327,20 @@ class GenericView(FlaskView):
             return flask.jsonify(messages), 409
 
         @app.errorhandler(InvalidUsage)
-        def handle_invalid_usage(error):
+        def handle_invalid_usage(error): # pylint: disable=unused-variable
             response = flask.jsonify(error.to_dict())
             response.status_code = error.status_code
             return response
 
+        # @app.errorhandler(404)
+        def handle_not_found(err): # pylint: disable=unused-variable
+            response = {'success': False, 'message': err.description if faraday_server.debug else err.name}
+            return flask.jsonify(response), 404
+
+        @app.errorhandler(500)
+        def handle_server_error(err): # pylint: disable=unused-variable
+            response = {'success': False, 'message': f"Exception: {err.original_exception}" if faraday_server.debug else 'Internal Server Error'}
+            return flask.jsonify(response), 500
 
 class GenericWorkspacedView(GenericView):
     """Abstract class for a view that depends on the workspace, that is
@@ -576,6 +585,23 @@ class RetrieveMixin:
     """Add GET /<id>/ route"""
 
     def get(self, object_id, **kwargs):
+        """
+        ---
+          tags: ["{tag_name}"]
+          summary: Retrieves {class_model}
+          parameters:
+          - in: path
+            name: object_id
+            required: true
+            schema:
+              type: integer
+          responses:
+            200:
+              description: Ok
+              content:
+                application/json:
+                  schema: {schema_class}
+        """
         return self._dump(self._get_object(object_id, eagerload=True,
                                            **kwargs), kwargs)
 
@@ -584,6 +610,30 @@ class RetrieveWorkspacedMixin(RetrieveMixin):
     """Add GET /<workspace_name>/<route_base>/<id>/ route"""
     # There are no differences with the non-workspaced implementations. The code
     # inside the view generic methods is enough
+    def get(self, object_id, workspace_name=None):
+        """
+        ---
+          tags: ["{tag_name}"]
+          summary: Retrieves {class_model}
+          parameters:
+          - in: path
+            name: object_id
+            required: true
+            schema:
+              type: integer
+          - in: path
+            name: workspace_name
+            required: true
+            schema:
+              type: string
+          responses:
+            200:
+              description: Ok
+              content:
+                application/json:
+                  schema: {schema_class}
+        """
+        return super(RetrieveWorkspacedMixin, self).get(object_id, workspace_name=workspace_name)
 
 
 class ReadOnlyView(SortableMixin,
@@ -611,6 +661,27 @@ class CreateMixin:
     """Add POST / route"""
 
     def post(self, **kwargs):
+        """
+        ---
+          tags: ["{tag_name}"]
+          summary: Creates {class_model}
+          requestBody:
+            required: true
+            content:
+              application/json:
+                schema: {schema_class}
+          responses:
+            201:
+              description: Created
+              content:
+                application/json:
+                  schema: {schema_class}
+            409:
+              description: Duplicated key found
+              content:
+                application/json:
+                  schema: {schema_class}
+        """
         context = {'updating': False}
 
         data = self._parse_data(self._get_schema_instance(kwargs, context=context),
@@ -642,7 +713,7 @@ class CreateMixin:
                     {
                         'message': 'Existing value',
                         'object': self._get_schema_class()().dump(
-                            conflict_obj).data,
+                            conflict_obj),
                     }
                 ))
             else:
@@ -701,6 +772,36 @@ class CreateWorkspacedMixin(CreateMixin, CommandMixin):
     the database.
     """
 
+    def post(self, workspace_name=None):
+        """
+        ---
+          tags: ["{tag_name}"]
+          summary: Creates {class_model}
+          parameters:
+          - in: path
+            name: workspace_name
+            required: true
+            schema:
+              type: string
+          requestBody:
+            required: true
+            content:
+              application/json:
+                schema: {schema_class}
+          responses:
+            201:
+              description: Created
+              content:
+                application/json:
+                  schema: {schema_class}
+            409:
+              description: Duplicated key found
+              content:
+                application/json:
+                  schema: {schema_class}
+        """
+        return super(CreateWorkspacedMixin, self).post(workspace_name=workspace_name)
+
     def _perform_create(self, data, workspace_name):
         assert not db.session.new
         workspace = self._get_workspace(workspace_name)
@@ -721,7 +822,7 @@ class CreateWorkspacedMixin(CreateMixin, CommandMixin):
                     {
                         'message': 'Existing value',
                         'object': self._get_schema_class()().dump(
-                            conflict_obj).data,
+                            conflict_obj),
                     }
                 ))
             else:
@@ -735,6 +836,34 @@ class UpdateMixin:
     """Add PUT /<id>/ route"""
 
     def put(self, object_id, **kwargs):
+        """
+        ---
+          tags: ["{tag_name}"]
+          summary: Updates {class_model}
+          parameters:
+          - in: path
+            name: object_id
+            required: true
+            schema:
+              type: integer
+          requestBody:
+            required: true
+            content:
+              application/json:
+                schema: {schema_class}
+          responses:
+            200:
+              description: Ok
+              content:
+                application/json:
+                  schema: {schema_class}
+            409:
+              description: Duplicated key found
+              content:
+                application/json:
+                  schema: {schema_class}
+        """
+
         obj = self._get_object(object_id, **kwargs)
         context = {'updating': True, 'object': obj}
         data = self._parse_data(self._get_schema_instance(kwargs, context=context),
@@ -777,7 +906,7 @@ class UpdateMixin:
                     {
                         'message': 'Existing value',
                         'object': self._get_schema_class()().dump(
-                            conflict_obj).data,
+                            conflict_obj),
                     }
                 ))
             else:
@@ -792,6 +921,41 @@ class UpdateWorkspacedMixin(UpdateMixin, CommandMixin):
     CommandObject associated to that command to register the change in
     the database.
     """
+
+    def put(self, object_id, workspace_name=None):
+        """
+        ---
+          tags: ["{tag_name}"]
+          summary: Updates {class_model}
+          parameters:
+          - in: path
+            name: object_id
+            required: true
+            schema:
+              type: integer
+          - in: path
+            name: workspace_name
+            required: true
+            schema:
+              type: string
+          requestBody:
+            required: true
+            content:
+              application/json:
+                schema: {schema_class}
+          responses:
+            200:
+              description: Ok
+              content:
+                application/json:
+                  schema: {schema_class}
+            409:
+              description: Duplicated key found
+              content:
+                application/json:
+                  schema: {schema_class}
+        """
+        return super(UpdateWorkspacedMixin, self).put(object_id, workspace_name=workspace_name)
 
     def _perform_update(self, object_id, obj, data, workspace_name=None):
         # # Make sure that if I created new objects, I had properly commited them
@@ -808,6 +972,20 @@ class UpdateWorkspacedMixin(UpdateMixin, CommandMixin):
 class DeleteMixin:
     """Add DELETE /<id>/ route"""
     def delete(self, object_id, **kwargs):
+        """
+        ---
+          tags: ["{tag_name}"]
+          summary: Deletes {class_model}
+          parameters:
+          - in: path
+            name: object_id
+            required: true
+            schema:
+                type: integer
+          responses:
+            204:
+              description: The resource was deleted successfully
+        """
         obj = self._get_object(object_id, **kwargs)
         self._perform_delete(obj, **kwargs)
         return None, 204
@@ -819,6 +997,28 @@ class DeleteMixin:
 
 class DeleteWorkspacedMixin(DeleteMixin):
     """Add DELETE /<workspace_name>/<route_base>/<id>/ route"""
+    def delete(self, object_id, workspace_name=None):
+
+        """
+          ---
+            tags: ["{tag_name}"]
+            summary: Deletes {class_model}
+            parameters:
+            - in: path
+              name: object_id
+              required: true
+              schema:
+                type: integer
+            - in: path
+              name: workspace_name
+              required: true
+              schema:
+                type: string
+            responses:
+              204:
+                description: The resource was deleted successfully
+        """
+        return super(DeleteWorkspacedMixin, self).delete(object_id, workspace_name=workspace_name)
 
     def _perform_delete(self, obj, workspace_name=None):
         with db.session.no_autoflush:
@@ -849,13 +1049,18 @@ class CountWorkspacedMixin:
             'total_count': 0
         }
         group_by = flask.request.args.get('group_by', None)
+        sort_dir = flask.request.args.get('order', "asc").lower()
+
         # TODO migration: whitelist fields to avoid leaking a confidential
         # field's value.
         # Example: /users/count/?group_by=password
         # Also we should check that the field exists in the db and isn't, for
         # example, a relationship
         if not group_by or group_by not in inspect(self.model_class).attrs:
-            flask.abort(404)
+            flask.abort(400, {"message": "group_by is a required parameter"})
+
+        if sort_dir and sort_dir not in ('asc', 'desc'):
+            flask.abort(400, {"message": "order must be 'desc' or 'asc'"})
 
         workspace_name = kwargs.pop('workspace_name')
         # using format is not a great practice.
@@ -869,6 +1074,14 @@ class CountWorkspacedMixin:
             .group_by(group_by)
             .filter(Workspace.name == workspace_name,
                     *self.count_extra_filters))
+
+        #order
+        order_by = group_by
+        if sort_dir == 'desc':
+            count = count.order_by(desc(order_by))
+        else:
+            count = count.order_by(asc(order_by))
+
         for key, count in count.values(group_by, func.count(group_by)):
             res['groups'].append(
                 {'count': count,
@@ -878,6 +1091,81 @@ class CountWorkspacedMixin:
                  }
             )
             res['total_count'] += count
+        return res
+
+
+class CountMultiWorkspacedMixin:
+    """Add GET /<workspace_name>/<route_base>/count_multi_workspace/ route
+
+    Receives a list of workspaces separated by comma in the workspaces
+    GET parameter.
+    If no workspace is specified, the view will return a 400 error.
+
+    Group objects by the field set in the group_by GET parameter. If it
+    isn't specified, the view will return a 400 error. For each group,
+    show the count of elements and its value.
+
+    This view is often used by some parts of the web UI. It was designed
+    to keep backwards compatibility with the count endpoint of Faraday
+    v2.
+    """
+
+    #: List of SQLAlchemy query filters to apply when counting
+    count_extra_filters = []
+
+    def count_multi_workspace(self, **kwargs):
+        res = {
+            'groups': defaultdict(dict),
+            'total_count': 0
+        }
+
+        workspace_names_list = flask.request.args.get('workspaces', None)
+
+        if not workspace_names_list:
+            flask.abort(400, {"message": "workspaces is a required parameter"})
+
+        workspace_names_list = workspace_names_list.split(',')
+
+        # Enforce workspace permission checking for each workspace
+        for workspace_name in workspace_names_list:
+            self._get_workspace(workspace_name)
+
+        group_by = flask.request.args.get('group_by', None)
+        sort_dir = flask.request.args.get('order', "asc").lower()
+
+        # TODO migration: whitelist fields to avoid leaking a confidential
+        # field's value.
+        # Example: /users/count/?group_by=password
+        # Also we should check that the field exists in the db and isn't, for
+        # example, a relationship
+        if not group_by or group_by not in inspect(self.model_class).attrs:
+            flask.abort(400, {"message": "group_by is a required parameter"})
+
+        if sort_dir and sort_dir not in ('asc', 'desc'):
+            flask.abort(400, {"message": "order must be 'desc' or 'asc'"})
+
+        grouped_attr = getattr(self.model_class, group_by)
+
+        q = db.session.query(
+                Workspace.name,
+                grouped_attr,
+                func.count(grouped_attr)
+            )\
+            .join(Workspace)\
+            .group_by(grouped_attr, Workspace.name)\
+            .filter(Workspace.name.in_(workspace_names_list))
+
+        #order
+        order_by = grouped_attr
+        if sort_dir == 'desc':
+            q = q.order_by(desc(Workspace.name), desc(order_by))
+        else:
+            q = q.order_by(asc(Workspace.name), asc(order_by))
+
+        for workspace, key, count in q.all():
+            res['groups'][workspace][key] = count
+            res['total_count'] += count
+
         return res
 
 
@@ -925,7 +1213,42 @@ class CustomModelSchemaOpts(ModelSchemaOpts):
         self.model_converter = CustomModelConverter
 
 
-class AutoSchema(with_metaclass(ModelSchemaMeta, Schema)):
+class DictWithData(dict):
+    """Like a dict, but with a data attribute pointing to itself.
+
+    This was designed to make code marshmallow 2/3 compatible:
+
+        Schema().load and Schema().dump don’t return a (data, errors)
+        [named]tuple any more. Only data is returned.
+
+    This class will avoid a lot of AttributeErrors with old marshmallow code
+    using `Schema().dump().data`.
+
+    """
+    # TODO remove this class
+    @property
+    def data(self):
+        return self
+
+
+# Restore marshmallow's DateTime field behavior of marshmallow 2 so it adds
+# "+00:00" to the serialized date. This ugly hack was done to keep our API
+# backwards-compatible. Yes, it's horrible.
+# Also, I'm putting it here because this file will be always imported in a very
+# early stage, before defining any schemas.
+# This commit broke backwards compatibility: https://github.com/marshmallow-code/marshmallow/commit/610ec20ea3be89684f7e4df8035d163c3561c904
+# TODO check if we can remove this
+def old_isoformat(dt, *args, **kwargs):
+    """Return the ISO8601-formatted UTC representation of a datetime object."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    else:
+        dt = dt.astimezone(datetime.timezone.utc)
+    return dt.isoformat(*args, **kwargs)
+fields.DateTime.SERIALIZATION_FUNCS['iso'] = old_isoformat
+
+
+class AutoSchema(Schema, metaclass=ModelSchemaMeta):
     """
     A Marshmallow schema that does field introspection based on
     the SQLAlchemy model specified in Meta.model.
@@ -937,6 +1260,40 @@ class AutoSchema(with_metaclass(ModelSchemaMeta, Schema)):
     # Use NullToBlankString instead of fields.String by default on text fields
     TYPE_MAPPING = Schema.TYPE_MAPPING.copy()
     TYPE_MAPPING[str] = NullToBlankString
+
+    def __init__(self, strict=None, *args, **kwargs):
+        # assert kwargs.get('unknown') == EXCLUDE, (
+        #     "This schema was initiatized without unknown=EXCLUDE. This means "
+        #     "that it will fail if you pass it fields that do not exist in the "
+        #     "schema, instead of ignoring them. I suppose this isn't what you "
+        #     "want. If you do want this behavior, consider removing this assert."
+        #     )
+
+        # TODO: remove strict argument. This was introduced during the
+        # migration to marshmallow 3. Once all occurences of strict=True are
+        # removed, this is not required anymore
+
+        super(AutoSchema, self).__init__(*args, **kwargs)
+        self.unknown = EXCLUDE
+
+    def load(self, *args, **kwargs):
+        # TODO remove this marshmallow 2/3 compatibility hack
+        ret = super(AutoSchema, self).load(*args, **kwargs)
+        if isinstance(ret, list) and all(isinstance(e, dict) for e in ret):
+            ret = [DictWithData(e) for e in ret]
+        elif isinstance(ret, dict):
+            ret = DictWithData(ret)
+        return ret
+
+    def dump(self, *args, **kwargs):
+        # TODO remove this marshmallow 2/3 compatibility hack
+        ret = super(AutoSchema, self).dump(*args, **kwargs)
+        if isinstance(ret, list) and all(isinstance(e, dict) for e in ret):
+            ret = [DictWithData(e) for e in ret]
+        elif isinstance(ret, dict):
+            ret = DictWithData(ret)
+        return ret
+
 
 
 class FilterAlchemyModelConverter(ModelConverter):
@@ -950,7 +1307,54 @@ class FilterAlchemyModelConverter(ModelConverter):
         kwargs['required'] = False
 
 
+class AutoSchemaFlaskParser(FlaskParser):
+    # It is required to use a schema class that has unknown=EXCLUDE by default.
+    # Otherwise, requests would fail if a not defined query parameter is sent
+    # (like group_by)
+    DEFAULT_SCHEMA_CLASS = AutoSchema
+
+
 class FilterSetMeta:
     """Base Meta class of FilterSet objects"""
-    parser = parser_imported
+    parser = AutoSchemaFlaskParser(location='query')
     converter = FilterAlchemyModelConverter()
+
+
+def get_user_permissions(user):
+    permissions = defaultdict(dict)
+
+    # Hardcode all permisions to allowed
+    ALLOWED = {'allowed': True, 'reason': None}
+
+    # TODO schema
+    generic_entities = {
+        'licences', 'methodology_templates', 'task_templates', 'users',
+        'vulnerability_template', 'workspaces',
+        'agents', 'agents_schedules', 'commands', 'comments', 'hosts',
+        'executive_reports', 'services', 'methodologies', 'tasks', 'vulns',
+        'credentials',
+    }
+
+    for entity in generic_entities:
+        permissions[entity]['view'] = ALLOWED
+        permissions[entity]['create'] = ALLOWED
+        permissions[entity]['update'] = ALLOWED
+        permissions[entity]['delete'] = ALLOWED
+
+    extra_permissions = {
+        'vulns.status_change',
+        'settings.view',
+        'settings.update',
+        'ticketing.jira',
+        'ticketing.servicenow',
+        'bulk_create.bulk_create',
+        'agents.run',
+        'workspace_comparison.compare',
+        'data_analysis.view',
+    }
+
+    for permission in extra_permissions:
+        (entity, action) = permission.split('.')
+        permissions[entity][action] = ALLOWED
+
+    return permissions

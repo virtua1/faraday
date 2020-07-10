@@ -2,7 +2,7 @@
 # Copyright (C) 2016  Infobyte LLC (http://www.infobytesec.com/)
 # See the file 'doc/LICENSE' for the license information
 from flask import Blueprint, abort, make_response, jsonify
-from filteralchemy import FilterSet, operators
+from filteralchemy import FilterSet, operators  # pylint:disable=unused-import
 from marshmallow import fields, post_load, ValidationError
 from marshmallow.validate import OneOf, Range
 from sqlalchemy.orm.exc import NoResultFound
@@ -35,7 +35,7 @@ class ServiceSchema(AutoSchema):
                          required=True,
                          attribute='port')
     status = fields.String(missing='open', validate=OneOf(Service.STATUSES),
-                           required=True, allow_none=False)
+                           allow_none=False)
     parent = fields.Integer(attribute='host_id')  # parent is not required for updates
     host_id = fields.Integer(attribute='host_id', dump_only=True)
     vulns = fields.Integer(attribute='vulnerability_count', dump_only=True)
@@ -62,7 +62,7 @@ class ServiceSchema(AutoSchema):
         return str(port)
 
     @post_load
-    def post_load_parent(self, data):
+    def post_load_parent(self, data, **kwargs):
         """Gets the host_id from parent attribute. Pops it and tries to
         get a Host with that id in the corresponding workspace.
         """
@@ -70,7 +70,7 @@ class ServiceSchema(AutoSchema):
         if self.context['updating']:
             if host_id is None:
                 # Partial update?
-                return
+                return data
 
             if host_id != self.context['object'].parent.id:
                 raise ValidationError('Can\'t change service parent.')
@@ -86,6 +86,8 @@ class ServiceSchema(AutoSchema):
                 ).one()
             except NoResultFound:
                 raise ValidationError('Host with id {} not found'.format(host_id))
+
+        return data
 
     class Meta:
         model = Service
@@ -105,6 +107,7 @@ class ServiceFilterSet(FilterSet):
 
 
 class ServiceView(FilterAlchemyMixin, ReadWriteWorkspacedView):
+
     route_base = 'services'
     model_class = Service
     schema_class = ServiceSchema
